@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
-import { Plus, X, ChevronLeft, ChevronRight, ChevronDown, Check, ImageOff, Trash2, Pencil, Lock, Download, Upload, Camera, Loader2 } from "lucide-react";
+import { Plus, X, ChevronLeft, ChevronRight, ChevronDown, ChevronUp, Check, ImageOff, Trash2, Pencil, Lock, Download, Upload, Camera, Loader2, GripVertical, Star } from "lucide-react";
 
 /* ────────────────────────────────────────────────────────────────────────
    24-HOUR STORIES
@@ -15,10 +15,24 @@ const STORAGE_KEY = "storyclone.stories.v1";
 const VIEWED_KEY = "storyclone.viewed.v1";
 const PROFILES_KEY = "storyclone.profiles.v1";
 const ACTIVE_PROFILE_KEY = "storyclone.active-profile.v1";
+const HIGHLIGHTS_KEY = "storyclone.highlights.v1";
+const REACTIONS_KEY = "storyclone.reactions.v1";
 const LIFETIME_MS = 24 * 60 * 60 * 1000;
 const MAX_W = 1080;
 const MAX_H = 1920;
 const SLIDE_MS = 5000;
+const LONG_PRESS_MS = 380;
+const REACTION_EMOJIS = ["❤️", "😂", "😮", "😢", "👏", "🔥"];
+
+// Simple composer filters, applied via canvas ctx.filter (CSS filter syntax)
+// and baked into the exported image so downloads/exports stay self-contained.
+const FILTERS = {
+  none: { label: "Normal", css: "" },
+  bw: { label: "B&W", css: "grayscale(1) contrast(1.05)" },
+  warm: { label: "Warm", css: "sepia(0.35) saturate(1.35) brightness(1.05)" },
+  cool: { label: "Cool", css: "saturate(1.15) hue-rotate(-8deg) brightness(1.03) contrast(1.05)" },
+  fade: { label: "Fade", css: "contrast(0.9) brightness(1.08) saturate(0.85)" },
+};
 
 // This is still a client-side-only app — there's no login or server, so
 // "users" here are local profiles you switch between in one browser, not
@@ -66,7 +80,26 @@ function formatBytes(bytes) {
   return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
 }
 
-function resizeImageToDataUrl(file) {
+function wrapText(ctx, text, maxWidth, maxLines) {
+  const words = text.split(/\s+/).filter(Boolean);
+  const lines = [];
+  let line = "";
+  for (const word of words) {
+    const test = line ? `${line} ${word}` : word;
+    if (ctx.measureText(test).width > maxWidth && line) {
+      lines.push(line);
+      line = word;
+    } else {
+      line = test;
+    }
+    if (lines.length >= maxLines) break;
+  }
+  if (line && lines.length < maxLines) lines.push(line);
+  return lines;
+}
+
+function processImageToDataUrl(file, opts = {}) {
+  const { filterCss = "", caption = "" } = opts;
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onerror = () => reject(new Error("Could not read file"));
@@ -81,7 +114,28 @@ function resizeImageToDataUrl(file) {
         canvas.width = w;
         canvas.height = h;
         const ctx = canvas.getContext("2d");
+        if (filterCss) ctx.filter = filterCss;
         ctx.drawImage(img, 0, 0, w, h);
+        ctx.filter = "none";
+
+        if (caption.trim()) {
+          const fontSize = Math.max(18, Math.round(w * 0.045));
+          ctx.font = `600 ${fontSize}px -apple-system, "Segoe UI", Roboto, sans-serif`;
+          ctx.textAlign = "center";
+          ctx.textBaseline = "alphabetic";
+          const lines = wrapText(ctx, caption.trim(), w * 0.86, 4);
+          const lineHeight = fontSize * 1.3;
+          let y = h - h * 0.07;
+          ctx.shadowColor = "rgba(0,0,0,0.6)";
+          ctx.shadowBlur = 10;
+          ctx.fillStyle = "#ffffff";
+          for (let i = lines.length - 1; i >= 0; i--) {
+            ctx.fillText(lines[i], w / 2, y);
+            y -= lineHeight;
+          }
+          ctx.shadowBlur = 0;
+        }
+
         resolve(canvas.toDataURL("image/jpeg", 0.85));
       };
       img.src = e.target.result;
@@ -167,8 +221,48 @@ function persistActiveProfileId(id) {
   }
 }
 
+function loadHighlights() {
+  try {
+    const raw = localStorage.getItem(HIGHLIGHTS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function persistHighlights(highlights) {
+  try {
+    localStorage.setItem(HIGHLIGHTS_KEY, JSON.stringify(highlights));
+  } catch {
+    /* non-critical */
+  }
+}
+
+function loadReactions() {
+  try {
+    const raw = localStorage.getItem(REACTIONS_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function persistReactions(reactions) {
+  try {
+    localStorage.setItem(REACTIONS_KEY, JSON.stringify(reactions));
+  } catch {
+    /* non-critical */
+  }
+}
+
 // One circle per author: bucket stories by authorId, then order each
-// author's own stories oldest-first so their reel plays in the order posted.
+// author's own stories by their manual `order` (set via drag-reorder) when
+// present, falling back to createdAt — so freshly posted stories with no
+// manual order yet still land in chronological position.
 function groupStoriesByAuthor(stories) {
   const map = new Map();
   for (const s of stories) {
@@ -178,7 +272,9 @@ function groupStoriesByAuthor(stories) {
     map.get(authorId).stories.push(s);
   }
   const groups = [...map.values()];
-  for (const g of groups) g.stories.sort((a, b) => a.createdAt - b.createdAt);
+  for (const g of groups) {
+    g.stories.sort((a, b) => (a.order ?? a.createdAt) - (b.order ?? b.createdAt));
+  }
   return groups;
 }
 
@@ -202,6 +298,15 @@ export default function StoriesFeature() {
   const [dragActive, setDragActive] = useState(false);
   const [pendingDeleteIds, setPendingDeleteIds] = useState(() => new Set());
   const [toast, setToast] = useState(null); // { id, label } | null
+  const [composeQueue, setComposeQueue] = useState([]); // [{ file, previewUrl }]
+  const [composeCaption, setComposeCaption] = useState("");
+  const [composeFilter, setComposeFilter] = useState("none");
+  const [composeBatchTotal, setComposeBatchTotal] = useState(0);
+  const [composeCompletedCount, setComposeCompletedCount] = useState(0);
+  const [reorderOpen, setReorderOpen] = useState(false);
+  const [peek, setPeek] = useState(null); // { group, story } | null
+  const [highlights, setHighlights] = useState(() => loadHighlights());
+  const [reactions, setReactions] = useState(() => loadReactions());
   const fileInputRef = useRef(null);
   const cameraInputRef = useRef(null);
   const importInputRef = useRef(null);
@@ -209,6 +314,9 @@ export default function StoriesFeature() {
   const addMenuRef = useRef(null);
   const deleteTimersRef = useRef(new Map());
   const dragCounterRef = useRef(0);
+  const composeQueueRef = useRef([]);
+  const pressTimerRef = useRef(null);
+  const pressEngagedRef = useRef(false);
 
   const activeProfile = profiles.find((p) => p.id === activeProfileId) || profiles[0] || DEFAULT_PROFILE;
 
@@ -244,6 +352,16 @@ export default function StoriesFeature() {
     return () => {
       deleteTimersRef.current.forEach((t) => clearTimeout(t));
       deleteTimersRef.current.clear();
+    };
+  }, []);
+
+  useEffect(() => {
+    composeQueueRef.current = composeQueue;
+  }, [composeQueue]);
+
+  useEffect(() => {
+    return () => {
+      composeQueueRef.current.forEach((item) => URL.revokeObjectURL(item.previewUrl));
     };
   }, []);
 
@@ -438,42 +556,102 @@ export default function StoriesFeature() {
     return () => clearInterval(id);
   }, []);
 
-  const handleFiles = useCallback(async (fileList) => {
+  const handleFiles = useCallback((fileList) => {
     const files = Array.from(fileList || []).filter((f) => f.type && f.type.startsWith("image/"));
     if (!files.length) {
       setError("Please choose an image file.");
       return;
     }
     setError("");
-    setUploadingCount((c) => c + files.length);
+    setComposeQueue((prev) => {
+      const wasEmpty = prev.length === 0;
+      const items = files.map((file) => ({ file, previewUrl: URL.createObjectURL(file) }));
+      setComposeBatchTotal((t) => (wasEmpty ? files.length : t + files.length));
+      if (wasEmpty) setComposeCompletedCount(0);
+      return [...prev, ...items];
+    });
+  }, []);
+
+  const makeStory = (dataUrl) => ({
+    id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    image: dataUrl,
+    createdAt: Date.now(),
+    order: Date.now(),
+    authorId: activeProfile.id,
+    authorName: activeProfile.name,
+  });
+
+  const postStory = (dataUrl) => {
+    setStories((prev) => {
+      const next = [makeStory(dataUrl), ...prev];
+      const ok = persistStories(next);
+      if (!ok) {
+        setError("Storage is full — delete an older story to add a new one.");
+        return prev;
+      }
+      return next;
+    });
+  };
+
+  const finalizeCompose = async () => {
+    const item = composeQueue[0];
+    if (!item) return;
+    setUploadingCount((c) => c + 1);
+    try {
+      const dataUrl = await processImageToDataUrl(item.file, {
+        filterCss: FILTERS[composeFilter]?.css || "",
+        caption: composeCaption,
+      });
+      postStory(dataUrl);
+    } catch {
+      setError("Couldn't process that image. Try another one.");
+    } finally {
+      setUploadingCount((c) => Math.max(0, c - 1));
+      URL.revokeObjectURL(item.previewUrl);
+      setComposeQueue((prev) => prev.slice(1));
+      setComposeCompletedCount((c) => c + 1);
+      setComposeCaption("");
+      setComposeFilter("none");
+    }
+  };
+
+  const skipCompose = () => {
+    const item = composeQueue[0];
+    if (item) URL.revokeObjectURL(item.previewUrl);
+    setComposeQueue((prev) => prev.slice(1));
+    setComposeCompletedCount((c) => c + 1);
+    setComposeCaption("");
+    setComposeFilter("none");
+  };
+
+  const cancelAllCompose = () => {
+    composeQueue.forEach((item) => URL.revokeObjectURL(item.previewUrl));
+    setComposeQueue([]);
+    setComposeBatchTotal(0);
+    setComposeCompletedCount(0);
+    setComposeCaption("");
+    setComposeFilter("none");
+  };
+
+  const postAllRemaining = async () => {
+    const items = [...composeQueue];
+    setComposeQueue([]);
+    setUploadingCount((c) => c + items.length);
     let anyFailed = false;
-    for (const file of files) {
+    for (const item of items) {
       try {
-        const dataUrl = await resizeImageToDataUrl(file);
-        const story = {
-          id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
-          image: dataUrl,
-          createdAt: Date.now(),
-          authorId: activeProfile.id,
-          authorName: activeProfile.name,
-        };
-        setStories((prev) => {
-          const next = [story, ...prev];
-          const ok = persistStories(next);
-          if (!ok) {
-            setError("Storage is full — delete an older story to add a new one.");
-            return prev;
-          }
-          return next;
-        });
+        const dataUrl = await processImageToDataUrl(item.file, {});
+        postStory(dataUrl);
       } catch {
         anyFailed = true;
       } finally {
         setUploadingCount((c) => Math.max(0, c - 1));
+        URL.revokeObjectURL(item.previewUrl);
+        setComposeCompletedCount((c) => c + 1);
       }
     }
     if (anyFailed) setError("Couldn't process one or more of those images.");
-  }, [activeProfile]);
+  };
 
   const onPickFile = (e) => {
     handleFiles(e.target.files);
@@ -534,7 +712,7 @@ export default function StoriesFeature() {
   const deleteStory = (id) => {
     setViewerReel(null);
     setPendingDeleteIds((prev) => new Set(prev).add(id));
-    setToast({ id, label: "Story deleted" });
+    setToast({ id, label: "Story deleted", actionLabel: "Undo", onAction: () => undoDelete(id) });
     const timer = setTimeout(() => {
       setStories((prev) => {
         const next = prev.filter((s) => s.id !== id);
@@ -564,6 +742,71 @@ export default function StoriesFeature() {
     setToast((t) => (t && t.id === id ? null : t));
   };
 
+  // apply a new manual order to one author's stories after drag/keyboard reordering
+  const reorderStory = (idsInOrder) => {
+    setStories((prev) => {
+      const orderMap = new Map(idsInOrder.map((id, i) => [id, i]));
+      const next = prev.map((s) => (orderMap.has(s.id) ? { ...s, order: orderMap.get(s.id) } : s));
+      persistStories(next);
+      return next;
+    });
+    setReorderOpen(false);
+  };
+
+  const isHighlighted = (id) => highlights.some((h) => h.id === id);
+
+  const showTimedToast = (id, label) => {
+    setToast({ id, label });
+    setTimeout(() => setToast((t) => (t && t.id === id ? null : t)), 2500);
+  };
+
+  const togglePinHighlight = (story) => {
+    if (isHighlighted(story.id)) {
+      setHighlights((prev) => {
+        const next = prev.filter((h) => h.id !== story.id);
+        persistHighlights(next);
+        return next;
+      });
+      showTimedToast(`unpin-${story.id}`, "Removed from Highlights");
+    } else {
+      setHighlights((prev) => {
+        const entry = {
+          id: story.id,
+          image: story.image,
+          authorId: story.authorId,
+          authorName: story.authorName,
+          createdAt: story.createdAt,
+          pinnedAt: Date.now(),
+        };
+        const next = [entry, ...prev];
+        persistHighlights(next);
+        return next;
+      });
+      showTimedToast(`pin-${story.id}`, "Added to Highlights");
+    }
+  };
+
+  const unpinHighlight = (id) => {
+    const ok = window.confirm("Remove this from Highlights? This can't be undone.");
+    if (!ok) return;
+    setHighlights((prev) => {
+      const next = prev.filter((h) => h.id !== id);
+      persistHighlights(next);
+      return next;
+    });
+    setViewerReel(null);
+  };
+
+  const toggleReaction = (storyId, emoji) => {
+    setReactions((prev) => {
+      const next = { ...prev };
+      if (next[storyId] === emoji) delete next[storyId];
+      else next[storyId] = emoji;
+      persistReactions(next);
+      return next;
+    });
+  };
+
   const storageUsageBytes = useMemo(() => {
     try {
       return (
@@ -577,6 +820,10 @@ export default function StoriesFeature() {
   }, [stories, viewedIds, profiles]);
   const STORAGE_BUDGET_BYTES = 5 * 1024 * 1024; // conservative; real limit is usually 5-10MB
   const storagePercent = Math.min(100, (storageUsageBytes / STORAGE_BUDGET_BYTES) * 100);
+
+  const myGroupForReorder = useMemo(() => {
+    return groupStoriesByAuthor(visibleStories).find((g) => g.authorId === activeProfile.id) || null;
+  }, [visibleStories, activeProfile.id]);
 
   return (
     <div
@@ -946,6 +1193,23 @@ export default function StoriesFeature() {
           padding: 0;
         }
         .sc-plus-badge:hover { background: #ffc866; }
+        .sc-reorder-badge {
+          position: absolute;
+          top: -1px;
+          left: -1px;
+          width: 18px;
+          height: 18px;
+          border-radius: 50%;
+          background: #2a3140;
+          border: 2px solid var(--bg);
+          color: var(--text);
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          cursor: pointer;
+          padding: 0;
+        }
+        .sc-reorder-badge:hover { background: #3a4152; }
         .sc-add-btn {
           width: 56px;
           height: 56px;
@@ -1012,6 +1276,50 @@ export default function StoriesFeature() {
           color: var(--text-dim);
           font-size: 11.5px;
           padding: 2px 4px 0;
+        }
+        .sc-subheader {
+          font-size: 12px;
+          letter-spacing: 0.1em;
+          text-transform: uppercase;
+          color: var(--text-dim);
+          margin: 18px 4px 10px;
+        }
+        .sc-ring-static {
+          position: absolute;
+          inset: 0;
+          border-radius: 50%;
+          border: 2.5px solid #4a5164;
+        }
+        .sc-peek-overlay {
+          position: fixed;
+          inset: 0;
+          z-index: 900;
+          display: flex;
+          align-items: flex-start;
+          justify-content: center;
+          padding-top: 14vh;
+          background: rgba(6, 8, 12, 0.55);
+          pointer-events: none;
+        }
+        .sc-peek-card {
+          width: 200px;
+          border-radius: 16px;
+          overflow: hidden;
+          background: #12161f;
+          border: 1px solid #2a3140;
+          box-shadow: 0 20px 50px rgba(0,0,0,0.5);
+        }
+        .sc-peek-img {
+          width: 100%;
+          height: 260px;
+          object-fit: cover;
+          display: block;
+        }
+        .sc-peek-meta {
+          padding: 8px 10px;
+          font-size: 12px;
+          color: var(--text);
+          text-align: center;
         }
         .sc-error {
           color: #ff8a7a;
@@ -1149,6 +1457,36 @@ export default function StoriesFeature() {
           justify-content: center;
           cursor: pointer;
         }
+        .sc-icon-btn.is-active {
+          color: #ffb84d;
+          background: rgba(255, 184, 77, 0.18);
+        }
+        .sc-reaction-bar {
+          position: absolute;
+          left: 0;
+          right: 0;
+          bottom: 14px;
+          z-index: 6;
+          display: flex;
+          justify-content: center;
+          gap: 6px;
+          padding: 0 12px;
+        }
+        .sc-reaction-btn {
+          background: rgba(0,0,0,0.4);
+          border: 1px solid rgba(255,255,255,0.15);
+          border-radius: 999px;
+          font-size: 17px;
+          line-height: 1;
+          padding: 7px 9px;
+          cursor: pointer;
+          transition: transform 0.1s ease, background 0.15s ease;
+        }
+        .sc-reaction-btn:hover { transform: translateY(-2px); }
+        .sc-reaction-btn.is-selected {
+          background: rgba(255, 184, 77, 0.28);
+          border-color: #ffb84d;
+        }
         .sc-nav-zone {
           position: absolute;
           top: 0;
@@ -1176,6 +1514,165 @@ export default function StoriesFeature() {
         }
         .sc-touch-zone.left { left: 0; }
         .sc-touch-zone.right { right: 0; }
+
+        .sc-compose-overlay {
+          position: fixed;
+          inset: 0;
+          background: rgba(6, 8, 12, 0.75);
+          z-index: 1300;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          padding: 16px;
+        }
+        .sc-compose-frame, .sc-reorder-frame {
+          width: 100%;
+          max-width: 380px;
+          max-height: 92vh;
+          overflow-y: auto;
+          background: var(--surface);
+          border: 1px solid var(--surface-2);
+          border-radius: 16px;
+          padding: 14px;
+          display: flex;
+          flex-direction: column;
+          gap: 12px;
+          box-shadow: 0 24px 60px rgba(0,0,0,0.5);
+        }
+        .sc-compose-top, .sc-reorder-header {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          color: var(--text);
+          font-size: 13px;
+        }
+        .sc-compose-top .sc-icon-btn, .sc-reorder-header .sc-icon-btn {
+          background: var(--surface-2);
+          color: var(--text);
+        }
+        .sc-compose-count { color: var(--text-dim); font-size: 12px; }
+        .sc-compose-post {
+          background: #ffb84d;
+          color: #1a1200;
+          border: none;
+          font-weight: 700;
+          font-size: 13px;
+          padding: 8px 16px;
+          border-radius: 999px;
+          cursor: pointer;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+        }
+        .sc-compose-preview {
+          position: relative;
+          width: 100%;
+          aspect-ratio: 9 / 14;
+          background: #000;
+          border-radius: 12px;
+          overflow: hidden;
+        }
+        .sc-compose-preview img {
+          width: 100%;
+          height: 100%;
+          object-fit: contain;
+        }
+        .sc-compose-caption-overlay {
+          position: absolute;
+          left: 6%;
+          right: 6%;
+          bottom: 7%;
+          color: #fff;
+          font-weight: 600;
+          font-size: 15px;
+          text-align: center;
+          text-shadow: 0 2px 8px rgba(0,0,0,0.6);
+          pointer-events: none;
+          word-break: break-word;
+        }
+        .sc-compose-filters {
+          display: flex;
+          gap: 8px;
+          overflow-x: auto;
+          padding-bottom: 2px;
+        }
+        .sc-filter-chip {
+          flex: 0 0 auto;
+          background: var(--surface-2);
+          border: 1px solid #2a3140;
+          color: var(--text-dim);
+          font-size: 12px;
+          padding: 7px 13px;
+          border-radius: 999px;
+          cursor: pointer;
+        }
+        .sc-filter-chip.is-active {
+          background: #ffb84d;
+          border-color: #ffb84d;
+          color: #1a1200;
+          font-weight: 600;
+        }
+        .sc-compose-caption-input {
+          background: var(--surface-2);
+          border: 1px solid #2a3140;
+          border-radius: 10px;
+          padding: 10px 12px;
+          color: var(--text);
+          font-size: 13px;
+        }
+        .sc-compose-caption-input:focus {
+          outline: none;
+          border-color: #ffb84d;
+        }
+        .sc-compose-bottom-actions {
+          display: flex;
+          justify-content: space-between;
+          gap: 8px;
+        }
+        .sc-compose-skip {
+          background: transparent;
+          border: none;
+          color: var(--text-dim);
+          font-size: 12px;
+          cursor: pointer;
+          padding: 6px 4px;
+        }
+        .sc-compose-skip:hover { color: var(--text); }
+
+        .sc-reorder-list {
+          display: flex;
+          flex-direction: column;
+          gap: 6px;
+          max-height: 50vh;
+          overflow-y: auto;
+        }
+        .sc-reorder-row {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          background: var(--surface-2);
+          border-radius: 10px;
+          padding: 6px 8px;
+          cursor: grab;
+        }
+        .sc-reorder-row.is-dragging { opacity: 0.5; }
+        .sc-reorder-handle { color: var(--text-dim); display: flex; }
+        .sc-reorder-thumb {
+          width: 40px;
+          height: 40px;
+          border-radius: 8px;
+          object-fit: cover;
+          flex: 0 0 auto;
+        }
+        .sc-reorder-index {
+          flex: 1;
+          color: var(--text-dim);
+          font-size: 12px;
+        }
+        .sc-reorder-move-btns {
+          display: flex;
+          gap: 2px;
+        }
       `}</style>
 
       <div className="sc-header">
@@ -1344,13 +1841,39 @@ export default function StoriesFeature() {
 
           const openGroup = (group) => {
             const startIndex = group.stories.findIndex((s) => !viewedIds.has(s.id));
-            setViewerReel({ stories: group.stories, startIndex: startIndex === -1 ? 0 : startIndex });
+            setViewerReel({ stories: group.stories, startIndex: startIndex === -1 ? 0 : startIndex, mode: "story" });
             markViewed(group.stories[startIndex === -1 ? 0 : startIndex].id);
           };
 
           const openAddMenu = () => setAddMenuOpen((v) => !v);
 
-          const renderGroupCircle = (group, { withPlusBadge } = {}) => {
+          // long-press peeks at the first unviewed story without marking it
+          // viewed or opening the full reel; releasing quickly opens normally
+          const startPress = (group) => {
+            pressEngagedRef.current = false;
+            clearTimeout(pressTimerRef.current);
+            pressTimerRef.current = setTimeout(() => {
+              pressEngagedRef.current = true;
+              const idx = group.stories.findIndex((s) => !viewedIds.has(s.id));
+              setPeek({ group, story: group.stories[idx === -1 ? 0 : idx] });
+            }, LONG_PRESS_MS);
+          };
+          const endPress = (group) => {
+            clearTimeout(pressTimerRef.current);
+            if (pressEngagedRef.current) {
+              setPeek(null);
+            } else {
+              openGroup(group);
+            }
+            pressEngagedRef.current = false;
+          };
+          const cancelPress = () => {
+            clearTimeout(pressTimerRef.current);
+            if (pressEngagedRef.current) setPeek(null);
+            pressEngagedRef.current = false;
+          };
+
+          const renderGroupCircle = (group, { withPlusBadge, withReorderBadge } = {}) => {
             const allViewed = group.stories.every((s) => viewedIds.has(s.id));
             const oldest = group.stories[0];
             const newest = group.stories[group.stories.length - 1];
@@ -1365,7 +1888,11 @@ export default function StoriesFeature() {
                   role="button"
                   tabIndex={0}
                   aria-label={`${group.authorName}, ${group.stories.length} ${group.stories.length === 1 ? "story" : "stories"}, ${allViewed ? "viewed" : "unviewed"}`}
-                  onClick={() => openGroup(group)}
+                  onPointerDown={() => startPress(group)}
+                  onPointerUp={() => endPress(group)}
+                  onPointerLeave={cancelPress}
+                  onPointerCancel={cancelPress}
+                  onContextMenu={(e) => e.preventDefault()}
                   onKeyDown={(e) => {
                     if (e.key === "Enter" || e.key === " ") {
                       e.preventDefault();
@@ -1391,6 +1918,18 @@ export default function StoriesFeature() {
                     alt={`${group.authorName} preview`}
                     style={{ opacity: allViewed ? 0.72 : 1 }}
                   />
+                  {withReorderBadge && group.stories.length > 1 && (
+                    <button
+                      className="sc-reorder-badge"
+                      aria-label="Reorder your stories"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setReorderOpen(true);
+                      }}
+                    >
+                      <GripVertical size={11} />
+                    </button>
+                  )}
                   {withPlusBadge && (
                     <button
                       className="sc-plus-badge"
@@ -1421,7 +1960,7 @@ export default function StoriesFeature() {
             <>
               <div className="sc-item sc-add-menu-wrap" ref={addMenuRef}>
                 {myGroup ? (
-                  renderGroupCircle(myGroup, { withPlusBadge: true })
+                  renderGroupCircle(myGroup, { withPlusBadge: true, withReorderBadge: true })
                 ) : (
                   <>
                     <div className="sc-avatar-wrap" style={{ position: "relative" }}>
@@ -1486,11 +2025,53 @@ export default function StoriesFeature() {
         })()}
       </div>
 
+      {peek && (
+        <div className="sc-peek-overlay" aria-hidden="true">
+          <div className="sc-peek-card">
+            <img src={peek.story.image} alt="" className="sc-peek-img" />
+            <div className="sc-peek-meta">{peek.group.authorName}</div>
+          </div>
+        </div>
+      )}
+
       {visibleStories.length === 0 && (
         <div className="sc-empty-hint">No stories yet — tap + to post one. It'll disappear in 24 hours.</div>
       )}
-      <div className="sc-hint-row">You can also drag images in, or paste from your clipboard.</div>
+      <div className="sc-hint-row">You can also drag images in, paste from your clipboard, or hold a circle to peek.</div>
       {error && <div className="sc-error">{error}</div>}
+
+      {highlights.length > 0 && (
+        <>
+          <div className="sc-subheader">Highlights</div>
+          <div className="sc-strip">
+            {groupStoriesByAuthor(highlights).map((group) => {
+              const cover = group.stories[group.stories.length - 1];
+              return (
+                <div className="sc-item" key={`hl-${group.authorId}`}>
+                  <div
+                    className="sc-avatar-wrap"
+                    role="button"
+                    tabIndex={0}
+                    aria-label={`${group.authorName} highlights, ${group.stories.length} ${group.stories.length === 1 ? "story" : "stories"}`}
+                    onClick={() => setViewerReel({ stories: group.stories, startIndex: 0, mode: "highlight" })}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        setViewerReel({ stories: group.stories, startIndex: 0, mode: "highlight" });
+                      }
+                    }}
+                  >
+                    <div className="sc-ring-static" aria-hidden="true" />
+                    <img className="sc-thumb" src={cover.image} alt={`${group.authorName} highlights preview`} />
+                  </div>
+                  <span className="sc-label">{group.authorName}</span>
+                  <span className="sc-sublabel">{group.stories.length} saved</span>
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
 
       <div className="sc-storage-meter-wrap">
         <div className="sc-storage-meter">
@@ -1510,7 +2091,9 @@ export default function StoriesFeature() {
       {toast && (
         <div className="sc-toast" role="status">
           <span>{toast.label}</span>
-          <button className="sc-toast-undo" onClick={() => undoDelete(toast.id)}>Undo</button>
+          {toast.onAction && (
+            <button className="sc-toast-undo" onClick={toast.onAction}>{toast.actionLabel || "Undo"}</button>
+          )}
         </div>
       )}
 
@@ -1519,16 +2102,46 @@ export default function StoriesFeature() {
           stories={viewerReel.stories}
           startIndex={viewerReel.startIndex}
           now={now}
+          mode={viewerReel.mode || "story"}
           onClose={() => setViewerReel(null)}
-          onDelete={deleteStory}
-          onView={markViewed}
+          onDelete={viewerReel.mode === "highlight" ? unpinHighlight : deleteStory}
+          onView={viewerReel.mode === "highlight" ? undefined : markViewed}
+          onTogglePin={togglePinHighlight}
+          isHighlighted={isHighlighted}
+          reactions={reactions}
+          onReact={toggleReaction}
+        />
+      )}
+
+      {reorderOpen && myGroupForReorder && (
+        <ReorderModal
+          stories={myGroupForReorder.stories}
+          onSave={reorderStory}
+          onClose={() => setReorderOpen(false)}
+        />
+      )}
+
+      {composeQueue.length > 0 && (
+        <ComposeModal
+          item={composeQueue[0]}
+          index={composeCompletedCount}
+          total={composeBatchTotal}
+          caption={composeCaption}
+          setCaption={setComposeCaption}
+          filterKey={composeFilter}
+          setFilterKey={setComposeFilter}
+          uploading={uploadingCount > 0}
+          onPost={finalizeCompose}
+          onSkip={skipCompose}
+          onCancelAll={cancelAllCompose}
+          onPostAllRemaining={postAllRemaining}
         />
       )}
     </div>
   );
 }
 
-function StoryViewer({ stories, startIndex, now, onClose, onDelete, onView }) {
+function StoryViewer({ stories, startIndex, now, onClose, onDelete, onView, mode = "story", onTogglePin, isHighlighted, reactions, onReact }) {
   const [index, setIndex] = useState(startIndex);
   const [progress, setProgress] = useState(0); // 0..1 for current story
   const [paused, setPaused] = useState(false);
@@ -1692,12 +2305,25 @@ function StoryViewer({ stories, startIndex, now, onClose, onDelete, onView }) {
         </div>
 
         <div className="sc-viewer-top">
-          <span className="sc-viewer-meta">{formatRemaining(remaining)}</span>
+          <span className="sc-viewer-meta">{mode === "highlight" ? "Highlight" : formatRemaining(remaining)}</span>
           <div className="sc-viewer-actions">
+            {mode === "story" && onTogglePin && (
+              <button
+                className={`sc-icon-btn ${isHighlighted?.(current.id) ? "is-active" : ""}`}
+                aria-label={isHighlighted?.(current.id) ? "Remove from Highlights" : "Save to Highlights"}
+                onClick={() => onTogglePin(current)}
+              >
+                <Star size={14} fill={isHighlighted?.(current.id) ? "currentColor" : "none"} />
+              </button>
+            )}
             <button className="sc-icon-btn" aria-label="Download story" onClick={downloadStory}>
               <Download size={14} />
             </button>
-            <button className="sc-icon-btn" aria-label="Delete story" onClick={() => onDelete(current.id)}>
+            <button
+              className="sc-icon-btn"
+              aria-label={mode === "highlight" ? "Remove from Highlights" : "Delete story"}
+              onClick={() => onDelete(current.id)}
+            >
               <Trash2 size={15} />
             </button>
             <button className="sc-icon-btn" aria-label="Close" onClick={onClose}>
@@ -1714,6 +2340,21 @@ function StoryViewer({ stories, startIndex, now, onClose, onDelete, onView }) {
           </div>
         )}
 
+        {onReact && (
+          <div className="sc-reaction-bar">
+            {REACTION_EMOJIS.map((emoji) => (
+              <button
+                key={emoji}
+                className={`sc-reaction-btn ${reactions?.[current.id] === emoji ? "is-selected" : ""}`}
+                aria-label={`React with ${emoji}`}
+                onClick={() => onReact(current.id, emoji)}
+              >
+                {emoji}
+              </button>
+            ))}
+          </div>
+        )}
+
         <button className="sc-nav-zone left" onClick={goPrev} aria-label="Previous story">
           <ChevronLeft size={28} />
         </button>
@@ -1722,6 +2363,159 @@ function StoryViewer({ stories, startIndex, now, onClose, onDelete, onView }) {
         </button>
         <div className="sc-touch-zone left" />
         <div className="sc-touch-zone right" />
+      </div>
+    </div>
+  );
+}
+
+function ComposeModal({
+  item,
+  index,
+  total,
+  caption,
+  setCaption,
+  filterKey,
+  setFilterKey,
+  uploading,
+  onPost,
+  onSkip,
+  onCancelAll,
+  onPostAllRemaining,
+}) {
+  return (
+    <div className="sc-compose-overlay" role="dialog" aria-modal="true" aria-label="Compose story">
+      <div className="sc-compose-frame">
+        <div className="sc-compose-top">
+          <button className="sc-icon-btn" aria-label="Cancel" onClick={onCancelAll}>
+            <X size={18} />
+          </button>
+          {total > 1 && (
+            <span className="sc-compose-count">{Math.min(index + 1, total)} of {total}</span>
+          )}
+          <button className="sc-compose-post" onClick={onPost} disabled={uploading}>
+            {uploading ? <Loader2 size={15} className="sc-spin" /> : "Post"}
+          </button>
+        </div>
+
+        <div className="sc-compose-preview">
+          <img src={item.previewUrl} alt="Preview" style={{ filter: FILTERS[filterKey]?.css || "" }} />
+          {caption.trim() && <div className="sc-compose-caption-overlay">{caption}</div>}
+        </div>
+
+        <div className="sc-compose-filters">
+          {Object.entries(FILTERS).map(([key, f]) => (
+            <button
+              key={key}
+              className={`sc-filter-chip ${filterKey === key ? "is-active" : ""}`}
+              onClick={() => setFilterKey(key)}
+            >
+              {f.label}
+            </button>
+          ))}
+        </div>
+
+        <input
+          className="sc-compose-caption-input"
+          placeholder="Add a caption…"
+          value={caption}
+          maxLength={140}
+          onChange={(e) => setCaption(e.target.value)}
+        />
+
+        {total > 1 && (
+          <div className="sc-compose-bottom-actions">
+            <button className="sc-compose-skip" onClick={onSkip}>Skip this one</button>
+            <button className="sc-compose-skip" onClick={onPostAllRemaining}>Post remaining as-is</button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ReorderModal({ stories, onSave, onClose }) {
+  const [order, setOrder] = useState(() => stories.map((s) => s.id));
+  const [dragId, setDragId] = useState(null);
+  const byId = useMemo(() => new Map(stories.map((s) => [s.id, s])), [stories]);
+
+  const moveBy = (id, delta) => {
+    setOrder((prev) => {
+      const next = [...prev];
+      const from = next.indexOf(id);
+      const to = from + delta;
+      if (to < 0 || to >= next.length) return prev;
+      [next[from], next[to]] = [next[to], next[from]];
+      return next;
+    });
+  };
+
+  const onDragOverRow = (e, overId) => {
+    e.preventDefault();
+    if (!dragId || overId === dragId) return;
+    setOrder((prev) => {
+      const next = [...prev];
+      const from = next.indexOf(dragId);
+      const to = next.indexOf(overId);
+      if (from === -1 || to === -1) return prev;
+      next.splice(from, 1);
+      next.splice(to, 0, dragId);
+      return next;
+    });
+  };
+
+  return (
+    <div className="sc-compose-overlay" role="dialog" aria-modal="true" aria-label="Reorder your stories">
+      <div className="sc-reorder-frame">
+        <div className="sc-reorder-header">
+          <span>Reorder your story</span>
+          <button className="sc-icon-btn" aria-label="Close" onClick={onClose}>
+            <X size={17} />
+          </button>
+        </div>
+        <div className="sc-reorder-list">
+          {order.map((id, i) => {
+            const s = byId.get(id);
+            if (!s) return null;
+            return (
+              <div
+                key={id}
+                className={`sc-reorder-row ${dragId === id ? "is-dragging" : ""}`}
+                draggable
+                onDragStart={() => setDragId(id)}
+                onDragOver={(e) => onDragOverRow(e, id)}
+                onDragEnd={() => setDragId(null)}
+              >
+                <span className="sc-reorder-handle" aria-hidden="true">
+                  <GripVertical size={15} />
+                </span>
+                <img className="sc-reorder-thumb" src={s.image} alt="" />
+                <span className="sc-reorder-index">{i + 1}</span>
+                <div className="sc-reorder-move-btns">
+                  <button
+                    className="sc-row-icon-btn"
+                    aria-label="Move earlier"
+                    disabled={i === 0}
+                    onClick={() => moveBy(id, -1)}
+                  >
+                    <ChevronUp size={13} />
+                  </button>
+                  <button
+                    className="sc-row-icon-btn"
+                    aria-label="Move later"
+                    disabled={i === order.length - 1}
+                    onClick={() => moveBy(id, 1)}
+                  >
+                    <ChevronDown size={13} />
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        <div className="sc-compose-bottom-actions">
+          <button className="sc-compose-skip" onClick={onClose}>Cancel</button>
+          <button className="sc-compose-post" onClick={() => onSave(order)}>Save order</button>
+        </div>
       </div>
     </div>
   );
